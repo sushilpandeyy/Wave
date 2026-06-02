@@ -1,134 +1,77 @@
 # Wave
 
-**Wave** is an AI companion chatbot with subscription tiers (`free`, `premium`,
-`premium++`), built on FastAPI + PostgreSQL + Redis, with OpenAI GPT for completions
-(set `OPENAI_API_KEY`; without it a mock client is used so everything runs offline).
+**Wave** is an AI companion chatbot with subscription tiers (`free`, `premium`, `premium++`),
+built on FastAPI + PostgreSQL + Redis, using OpenAI GPT for replies (without an API key a mock
+client runs everything offline).
 
-Built so far: **Part 1** (data model — schema, indexes, queries) and **Part 2** (the
-tier-aware load balancer — routing, worker pools, autoscaling, and load shedding).
+## Architecture (High-Level Design)
+
+![Wave high-level architecture](docs/HLD.png)
 
 ## Quickstart
 
-Everything with Docker — postgres, redis, api, the autoscaler (`manager`), and a pool of
-`worker` containers:
-
 ```bash
 docker compose up -d --build --scale worker=3
-docker compose exec api python -m scripts.init_db   # tables + indexes
-docker compose exec api python -m scripts.seed      # one user per tier (prints ids)
 ```
 
-Then open a WebSocket to `ws://127.0.0.1:8000/ws/chat?user_id=<id>`, send
-`{"message": "..."}`, and receive `token` frames then a `done` frame. Live state is at
-`GET /metrics`; health at `GET /healthz`.
-
-> No Docker? Point `POSTGRES_DSN`/`REDIS_URL` at local servers and run the three roles in
-> separate shells: `uvicorn app.api:app`, `python -m app.manager`, `python -m app.worker`.
+- Starts `api`, `manager` (autoscaler), `reflector`, and N `worker`s.
+- The schema is created automatically (`migrate` one-shot). To chat, seed users yourself: `docker compose run --rm api python -m scripts.seed`.
+- Chat: open `ws://127.0.0.1:8000/ws/chat?user_id=<id>`, send `{"message": "..."}`, get `token` frames then `done`.
+- Check live state at `GET /metrics`, health at `GET /healthz`.
 
 ---
 
-## Data model
+## Part 1 — Data model
 
-Four tables, related like this:
+Four tables: `users` ─1:1─ `personalities`, `users` ─1:N─ `sessions` ─1:N─ `messages`.
 
-```
-users ──1:1── personalities
-  │
-  └──1:N── sessions ──1:N── messages
-```
+- A **session** is one conversation; a user has **at most one active session** at a time.
+- `tier` is a **real column**, not JSON — so it can be indexed and grouped on cheaply.
+- `messages` stores its own `user_id` and `tier`, so common reads don't need joins.
+- **One personality per user**, updated in place.
+- UUID keys, UTC timestamps everywhere.
+- Indexes match the real queries: active session, recent messages, active users by tier.
 
-| Table | What it holds | Columns |
-|---|---|---|
-| **users** | account + subscription tier | `id`, `display_name`, `tier`, `locale`, `timezone`, `last_active_at`, `settings` (jsonb), `created_at` |
-| **personalities** | the companion's persona, one per user | `id`, `user_id` (unique), `traits` (jsonb), `summary`, `updated_at`, `created_at` |
-| **sessions** | one conversation episode | `id`, `user_id`, `status` (`active`\|`closed`), `title`, `message_count`, `last_message_at`, `created_at` |
-| **messages** | a single chat turn | `id`, `session_id`, `user_id`, `tier`, `role` (`user`\|`assistant`\|`system`), `content`, `mood`, `created_at` |
+Details: **[docs/data-model.md](docs/data-model.md)**.
 
-## Decisions we made (and why)
+## Part 2 — Tier-aware load balancer
 
-- **A "session" is one conversation *episode*.** A user has **at most one active
-  session** at a time; a new one opens after the previous closes. Clean unit for
-  scoping context and answering "what are we talking about right now."
-- **`tier` is a real column, not JSON.** It's read on every message and grouped on in
-  analytics — a typed column gets an index and a cheap `GROUP BY`; a JSON blob doesn't.
-- **`messages` carries its own `user_id` and `tier`.** Denormalized on purpose: the hot
-  reads and per-tier counts never have to join back to `sessions`/`users`. `tier` is the
-  tier *at send time*, which is what those counts actually want.
-- **One personality per user, updated in place.** Kept simple for now (versioning can
-  come later if we want to track how a persona evolved).
-- **Defaults live in the database**, not just the ORM — so plain SQL inserts work too.
-- **UUID primary keys, `timestamptz` everywhere (UTC).** `mood` is nullable until a
-  message is classified.
+- **Pull-based**: the hot path is 1 Redis op to enqueue + 1 `BZPOPMIN` to dequeue — no central dispatcher.
+- **Three lanes** (`ent > prem > free`), served in priority order so higher tiers go first.
+- **Three worker pools**: `priority` (enterprise only), `standard` (always on), `overflow` (elastic).
+- **One pressure signal (0–3)** combines load, latency, and health, and drives everything.
+- Autoscaler grows/shrinks `overflow` within a single worker budget (`W_MAX`).
+- Under load, **lowest tier degrades first**; **enterprise never degrades or gets dropped**.
+- A small fairness chance keeps the `free` lane from ever starving.
 
-Indexes and the exact query patterns (with performance notes) live in
-**[docs/data-model.md](docs/data-model.md)**.
+Details: **[docs/load-balancer.md](docs/load-balancer.md)**.
 
-## Tier-aware load balancer
+## Part 3 — Rate limiting & safety
 
-Incoming chats are admitted and routed to **pull-based worker pools** by tier. The hot path
-is one atomic Redis op to enqueue and one blocking `BZPOPMIN` to dequeue — no central
-dispatcher.
+- Per-user **token-bucket** rate limit, done in one Redis op.
+- Over the limit → Wave says **one warm line, then stays quiet** (never spams).
+- Near the limit → one gentle heads-up, still answered.
+- **Per-IP guard** on connect to stop floods and fake users.
+- Safety is **model-driven**: the model tags each reply (`jailbreak` / `nsfw` / `boundary` / `crisis`) and Wave responds in character — **no keyword regex**.
+- A **crisis message gets a caring reply**, not a refusal.
 
-- **Three pools** (`priority` enterprise-only · `standard` · elastic `overflow`) pulling
-  three lanes `q:ent > q:prem > q:free` in priority order. The priority pool keeps
-  `premium++` stable under any load.
-- **One pressure signal** folds all four routing inputs — tier, system load, latency, and
-  pool health (a circuit breaker) — into one number that drives autoscaling (within a `W_MAX`
-  worker budget) and shedding.
-- Under pressure, traffic degrades **lowest-tier-first**: free shrinks context/model, then
-  soft-rejects at the top of the scale; premium degrades slower; enterprise never does.
+Details: **[docs/safety-rate-limiting.md](docs/safety-rate-limiting.md)**.
 
-How it works, the Redis key map, and the algorithms are in
-**[docs/load-balancer.md](docs/load-balancer.md)**.
+## Part 4 — Observability
 
-## Graceful rate limiting & safety
+- Analytics never block the chat: `track()` just drops an event on a queue; a background task flushes to Redis.
+- Under pressure, low-value events are dropped first; important ones always kept.
+- **JSON logs** with a correlation id (`message_id`) on every line, so one chat is traceable across `api` and `worker`.
+- Timeline `received → enqueued → dequeued → first_token → completed → delivered` shows where time goes.
+- **Graceful shutdown**: analytics and logs flush on exit, nothing is lost.
 
-Wave never returns a harsh system message. At the front of the producer path, each message
-passes a per-user **token-bucket rate limit** (one Redis Lua op) and a **safety screen**
-(local, no await) before it's enqueued.
+Details: **[docs/observability.md](docs/observability.md)**.
 
-- Over the limit → she says one warm line ("okay okay, I need a tiny breather — give me a
-  moment"), then goes quiet — repeated hits are silenced, never spammed. Subsequent limits =
-  silence (defined behavior).
-- "Approaching" the limit → one gentle "let's pace ourselves" heads-up, still served.
-- Unsafe input → an in-character response, not an error. Detection is **model-driven**: the
-  model emits a control flag (`jailbreak` / `nsfw` / `boundary` / `crisis`) and the app swaps in
-  Wave's matching line — jailbreaks get a playful deflect, NSFW a gentle boundary, and a
-  **crisis (self-harm) message gets a caring reply**. No brittle keyword regex.
-- Enterprise limits are set so high it's effectively never rate-limited.
-- A coarse **per-IP guard** at connection accept catches floods / rotating fake `user_id`s
-  (the WebSocket is unauthenticated). Volumetric/DoS limiting in production would also sit at
-  the GCP edge (Cloud Armor / the load balancer).
+## Part 5 — Personality reflection
 
-Details in **[docs/safety-rate-limiting.md](docs/safety-rate-limiting.md)**.
+- When a chat goes idle, a **reaper** closes the session and queues it for reflection (off the chat path).
+- A background LLM pass updates the user's **traits** and **summary** from the conversation.
+- Traits are **blended slowly** toward the new read, so one odd chat can't swing the persona.
+- **Bad model output never corrupts** the personality — it only writes after a clean parse.
 
-## Observability
-
-Analytics, structured logging, and tracing that never slow the chat path — the only hot-path
-cost is an in-memory enqueue.
-
-- **Analytics** — `track()` is a `put_nowait` on a bounded queue (**~0.36 µs/call**); a
-  background task batches and flushes to Redis. Under pressure it sheds *verbose* events first
-  and keeps critical ones.
-- **Structured logging** — JSON to stdout written off-loop (QueueHandler/Listener); a
-  correlation id (the `message_id`) and context (tier, user, op) are stamped on every line.
-- **Tracing** — milestones `received → enqueued → dequeued → first_token → completed →
-  delivered` let you reconstruct one turn's **round-trip** and its breakdown (queue wait, TTFT,
-  generation) by `corr_id`. `timed()` auto-logs any operation over a threshold.
-- **Graceful shutdown** — on SIGTERM the analytics queue drains and logs flush; no data loss.
-
-Details in **[docs/observability.md](docs/observability.md)**.
-
-## Personality reflection (learning between sessions)
-
-When a conversation goes idle, the `reflector` service closes the session and runs a background
-LLM **reflection** that evolves Wave's per-user model — so the next chat feels continuous.
-
-- A **reaper** atomically claims idle sessions and enqueues the worthwhile ones (`wave:reflect`).
-- Consumers run a JSON reflection over the transcript and update `personalities.traits` +
-  `summary`. Traits are **blended** toward the model's suggestion (learning rate α) so the
-  persona evolves *gradually* — one odd conversation can't swing it, and bad/invalid output
-  never corrupts the stored personality.
-- Entirely off the chat hot path; shuts down draining cleanly.
-
-Details in **[docs/reflection.md](docs/reflection.md)**.
+Details: **[docs/reflection.md](docs/reflection.md)**.

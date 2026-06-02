@@ -72,13 +72,14 @@ Docs: `docs/data-model.md` (Part 1), `docs/load-balancer.md` (Part 2),
 
 ## Run locally
 
-Postgres + Redis with the default DSNs. With Docker:
+Postgres + Redis with the default DSNs. With Docker (one command — the `migrate` one-shot
+service bootstraps the schema automatically; no seeding):
 
 ```bash
 docker compose up -d --build --scale worker=3
-docker compose exec api python -m scripts.init_db
-docker compose exec api python -m scripts.seed
 ```
 
-Without Docker, run the three roles in separate shells against local servers:
-`uvicorn app.api:app` · `python -m app.manager` · `python -m app.worker`.
+Schema: `scripts/init_db.py` (run by the `migrate` service). To get chattable users, seed
+manually: `docker compose run --rm api python -m scripts.seed`. Without Docker, run the roles
+in separate shells against local servers: `uvicorn app.api:app` · `python -m app.manager` ·
+`python -m app.worker` · `python -m app.reflector`.

@@ -25,6 +25,17 @@ services:
       timeout: 3s
       retries: 5
 
+  # One-shot: create schema (tables + indexes). The app services wait for this to finish.
+  migrate:
+    build: .
+    command: ["python", "-m", "scripts.init_db"]
+    environment:
+      POSTGRES_DSN: postgresql+asyncpg://wave:wave@postgres:5432/wave
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  # Tier-aware load balancer (producer / WebSocket API).
   api:
     build: .
     environment:
@@ -35,8 +46,9 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
 
-  # Control plane: the autoscaler. Single replica.
+  # Control plane: the autoscaler. Single replica (Redis-only).
   manager:
     build: .
     command: ["python", "-m", "app.manager"]
@@ -57,6 +69,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
 
   # Reflection plane: close idle sessions + evolve user personalities (background).
   reflector:
@@ -68,6 +81,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
 
 volumes:
   wave_pg:

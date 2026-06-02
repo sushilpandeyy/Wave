@@ -29,8 +29,7 @@ async def get_or_open_session(db: AsyncSession, user_id: str) -> Session:
         return existing
     session = Session(user_id=user_id, status="active")
     db.add(session)
-    await db.commit()
-    await db.refresh(session)
+    await db.commit()  # PK is a client-side uuid4, so no refresh round-trip needed
     return session
 
 
@@ -70,7 +69,12 @@ async def add_message(
     content: str,
     mood: str | None = None,
 ) -> Message:
-    """Insert a message and bump the session's counters in one transaction."""
+    """Insert a message and bump the session's counters in one transaction.
+
+    Hot path (runs per user message AND per assistant reply): the counter bump is a
+    single atomic UPDATE — no SELECT to load the session, no read-modify-write race —
+    and we skip the post-commit refresh since callers don't read the returned row.
+    """
     msg = Message(
         session_id=session_id,
         user_id=user_id,
@@ -82,12 +86,12 @@ async def add_message(
     if message_id is not None:
         msg.id = message_id
     db.add(msg)
-    sess = await db.get(Session, session_id)
-    if sess is not None:
-        sess.message_count += 1
-        sess.last_message_at = func.now()
+    await db.execute(
+        update(Session)
+        .where(Session.id == session_id)
+        .values(message_count=Session.message_count + 1, last_message_at=func.now())
+    )
     await db.commit()
-    await db.refresh(msg)
     return msg
 
 
