@@ -3,23 +3,26 @@
 **Wave** is an AI companion chatbot with subscription tiers (`free`, `premium`,
 `premium++`), built on FastAPI + PostgreSQL + Redis.
 
-> This stage is the **database layer only** — schema, indexes, and the core queries
-> for Part 1 (Data Modeling & Query Design). The rest of the pipeline comes later.
+Built so far: **Part 1** (data model — schema, indexes, queries) and **Part 2** (the
+tier-aware load balancer — routing, worker pools, autoscaling, and load shedding).
 
 ## Quickstart
 
-You need a Postgres with a `wave` role and `wave` database (the default `POSTGRES_DSN`;
-override it via env or `.env`).
+Everything with Docker — postgres, redis, api, the autoscaler (`manager`), and a pool of
+`worker` containers:
 
 ```bash
-# Local Postgres — no Docker:
-pg_ctl -D .pgdata -l pg.log start    # first time: initdb -U wave -D .pgdata && createdb -U wave wave
-
-pip install -r requirements.txt
-python -m scripts.init_db            # creates tables + indexes
+docker compose up -d --build --scale worker=3
+docker compose exec api python -m scripts.init_db   # tables + indexes
+docker compose exec api python -m scripts.seed      # one user per tier (prints ids)
 ```
 
-> Prefer Docker? `docker compose up -d` replaces the `pg_ctl` step.
+Then open a WebSocket to `ws://127.0.0.1:8000/ws/chat?user_id=<id>`, send
+`{"message": "..."}`, and receive `token` frames then a `done` frame. Live state is at
+`GET /metrics`; health at `GET /healthz`.
+
+> No Docker? Point `POSTGRES_DSN`/`REDIS_URL` at local servers and run the three roles in
+> separate shells: `uvicorn app.api:app`, `python -m app.manager`, `python -m app.worker`.
 
 ---
 
@@ -58,3 +61,21 @@ users ──1:1── personalities
 
 Indexes and the exact query patterns (with performance notes) live in
 **[docs/data-model.md](docs/data-model.md)**.
+
+## Tier-aware load balancer
+
+Incoming chats are admitted and routed to **pull-based worker pools** by tier. The hot path
+is one atomic Redis op to enqueue and one blocking `BZPOPMIN` to dequeue — no central
+dispatcher.
+
+- **Three pools** (`priority` enterprise-only · `standard` · elastic `overflow`) pulling
+  three lanes `q:ent > q:prem > q:free` in priority order. The priority pool keeps
+  `premium++` stable under any load.
+- **One pressure signal** folds all four routing inputs — tier, system load, latency, and
+  pool health (a circuit breaker) — into one number that drives autoscaling (within a `W_MAX`
+  worker budget) and shedding.
+- Under pressure, traffic degrades **lowest-tier-first**: free shrinks context/model, then
+  soft-rejects at the top of the scale; premium degrades slower; enterprise never does.
+
+How it works, the Redis key map, and the algorithms are in
+**[docs/load-balancer.md](docs/load-balancer.md)**.

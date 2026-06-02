@@ -15,5 +15,48 @@ services:
       timeout: 3s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    environment:
+      POSTGRES_DSN: postgresql+asyncpg://wave:wave@postgres:5432/wave
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  # Control plane: the autoscaler. Single replica.
+  manager:
+    build: .
+    command: ["python", "-m", "app.manager"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      W_MAX: "32"
+    depends_on:
+      redis: {condition: service_healthy}
+
+  # Data plane: worker pool. Scale with `docker compose up --scale worker=3`.
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      POSTGRES_DSN: postgresql+asyncpg://wave:wave@postgres:5432/wave
+      REDIS_URL: redis://redis:6379/0
+      WORKERS_PER_CONTAINER: "16"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
 volumes:
   wave_pg:

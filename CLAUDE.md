@@ -27,38 +27,42 @@ lower tiers — without ever sounding technical or robotic to the end user.
 FastAPI · PostgreSQL (SQLAlchemy async + asyncpg) · Redis · Docker Compose.
 (Current code = DB layer only — see below.)
 
-## Current state — DB layer only
+## Current state — Part 1 (data) + Part 2 (load balancer)
 
-The repo is intentionally stripped down to **Part 1 (Data Modeling & Query Design)**.
-The earlier pipeline (api/services/workers/routing) was removed and will be rebuilt
-later. Only the database layer exists right now:
+Layout (`app/`):
+- `db.py`, `models.py` — Part 1 data layer (4 models, enums, indexes). `scripts/init_db.py`
+  creates tables; `scripts/seed.py` seeds one user per tier.
+- `config.py` — env settings; budget is one dial: `W_MAX` (max total concurrent workers).
+- `tiers.py` — `TierPolicy`, lane/priority maps, and `degrade(tier, pressure)`.
+- `redis.py` — shared async client. `balancer.py` — the LB: atomic admit+enqueue Lua,
+  `BZPOPMIN` dequeue, snapshot. `streaming.py` — pub/sub token bus.
+- `health.py` — heartbeats/in-flight/latency. `pool.py` — `Autoscaler` + `WorkerSupervisor`.
+- `worker.py` — pull loop + container entrypoint (`python -m app.worker`).
+  `manager.py` — autoscaler entrypoint (`python -m app.manager`).
+- `queries.py` — reusable Part-1 queries. `prompt.py`, `llm.py` (mock).
+- `api.py` — FastAPI: `WS /ws/chat`, `/healthz`, `/metrics`.
 
-- `app/db.py` — async SQLAlchemy `Base`, engine, `SessionLocal`, `get_session`
-  (DSN from `POSTGRES_DSN`).
-- `app/models.py` — the four models (`User`, `Personality`, `Session`, `Message`)
-  with the `Tier` / `MessageRole` enums and all indexes.
-- `scripts/init_db.py` — `create_all` helper.
-
-The schema, indexes, and core queries are documented in `README.md`
-("Data Modeling & Query Design").
+Docs: `docs/data-model.md` (Part 1), `docs/load-balancer.md` (Part 2).
 
 ## Conventions
 
-- Keep all I/O async — no blocking calls.
-- `tier` is a first-class column on `users` (and denormalized onto `messages`),
-  never buried in JSON.
-- A **session** is one conversation episode; ≤1 active session per user (enforced by
-  a partial unique index).
+- Keep all I/O async; hot path = 1 Redis op to enqueue + 1 `BZPOPMIN`. No unnecessary awaits.
+- `tier` is a first-class column on `users` (and denormalized onto `messages`), never JSON.
+- A **session** is one conversation episode; ≤1 active session per user (partial unique index).
+- Tier behaviour differs only by priority, reserved capacity, and degradation order — driven
+  by ONE global pressure signal (folds system load + latency + a health circuit breaker; no
+  per-tier latency SLAs). Three pools: priority (ent-only) / standard / elastic overflow.
+  Enterprise never degrades/sheds.
 
 ## Run locally
 
-Needs a Postgres with a `wave` role + `wave` db (the default `POSTGRES_DSN`). A local
-`.pgdata` cluster works — no Docker required:
+Postgres + Redis with the default DSNs. With Docker:
 
 ```bash
-pg_ctl -D .pgdata -l pg.log start   # (initdb -U wave -D .pgdata first time)
-pip install -r requirements.txt
-python -m scripts.init_db           # create tables + indexes
+docker compose up -d --build --scale worker=3
+docker compose exec api python -m scripts.init_db
+docker compose exec api python -m scripts.seed
 ```
 
-Docker is optional: `docker compose up -d` is an alternative to the local cluster.
+Without Docker, run the three roles in separate shells against local servers:
+`uvicorn app.api:app` · `python -m app.manager` · `python -m app.worker`.
