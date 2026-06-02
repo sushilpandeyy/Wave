@@ -1,8 +1,10 @@
 """FastAPI app: the producer side of the pipeline.
 
-A WebSocket chat endpoint plus health/metrics. The hot path per message is tight:
-tier is resolved once per connection (cached), then each message does one DB insert,
-one subscribe, and one atomic admit-and-enqueue. Streaming back is pub/sub.
+A WebSocket chat endpoint plus health/metrics. Per message the hot path is, in order
+and short-circuiting on the first stop: one rate-limit Lua op, a local safety screen
+(no await), then persist + subscribe + atomic admit. Whenever something has to interrupt
+the chat, Wave replies in her own voice (`app/voice.py`) — never a system error — and the
+NoticeGate keeps us from saying the same kind of thing twice in a row.
 """
 
 import uuid
@@ -18,27 +20,37 @@ from app.health import HealthRegistry
 from app.models import MessageRole, User
 from app.pool import CIRCUIT_KEY, TARGET_KEY
 from app.queries import add_message, get_or_open_session
+from app.ratelimit import RateLimiter
 from app.redis import close_redis, get_redis
+from app.safety import SafetyScreener
 from app.streaming import StreamBus
-
-SHED_NOTICE = (
-    "I'm a little swamped right now — give me a moment and try again shortly."
-)
-ERROR_NOTICE = "Something hiccupped on my end — mind trying again?"
+from app.tiers import POLICIES
+from app.voice import NoticeGate, say
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     redis = get_redis()
+    app.state.redis = redis
     app.state.lb = LoadBalancer(redis, settings.free_hard_cap)
     app.state.stream = StreamBus(redis)
     app.state.health = HealthRegistry(redis)
-    app.state.redis = redis
+    app.state.limiter = RateLimiter(redis)
+    app.state.gate = NoticeGate(redis)
+    app.state.screener = SafetyScreener()
     yield
     await close_redis()
 
 
 app = FastAPI(title="Wave", lifespan=lifespan)
+
+
+def _client_ip(websocket: WebSocket) -> str:
+    """Real client IP — honor a proxy/LB's X-Forwarded-For, else the socket peer."""
+    xff = websocket.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return websocket.client.host if websocket.client else "unknown"
 
 
 @app.get("/healthz")
@@ -69,6 +81,13 @@ async def metrics() -> dict:
 async def ws_chat(websocket: WebSocket) -> None:
     """`?user_id=<uuid>`. Send `{"message": "..."}`; receive token/done/notice frames."""
     await websocket.accept()
+
+    # Coarse per-IP guard before any DB work — flood / fake-user_id defense.
+    if not (await app.state.limiter.check_ip(_client_ip(websocket))).allowed:
+        await websocket.send_json({"type": "notice", "message": say("overloaded")})
+        await websocket.close()
+        return
+
     user_id = websocket.query_params.get("user_id", "")
 
     # Resolve + cache tier once per connection — no per-message DB tier lookup.
@@ -83,47 +102,68 @@ async def ws_chat(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "notice", "message": "Unknown user."})
             await websocket.close()
             return
-        tier = user.tier
-        session = await get_or_open_session(db, str(user.id))
-        session_id = str(session.id)
+        uid, tier = str(user.id), user.tier
+        policy = POLICIES[tier]
+        session_id = str((await get_or_open_session(db, uid)).id)
 
-    lb: LoadBalancer = websocket.app.state.lb
-    stream: StreamBus = websocket.app.state.stream
+    lb: LoadBalancer = app.state.lb
+    stream: StreamBus = app.state.stream
+    limiter: RateLimiter = app.state.limiter
+    gate: NoticeGate = app.state.gate
+    screener: SafetyScreener = app.state.screener
+
+    async def notice(msg: str) -> None:
+        await websocket.send_json({"type": "notice", "message": msg})
+
+    async def persist(role: MessageRole, content: str, mood: str | None = None) -> str:
+        mid = str(uuid.uuid4())
+        async with SessionLocal() as db:
+            await add_message(
+                db, message_id=mid, session_id=session_id, user_id=uid,
+                tier=tier, role=role, content=content, mood=mood,
+            )
+        return mid
 
     try:
         while True:
             raw = await websocket.receive_json()
             text = (raw or {}).get("message")
             if not isinstance(text, str) or not text.strip():
-                await websocket.send_json(
-                    {"type": "notice", "message": "I didn't catch that — try again?"}
-                )
+                await notice("I didn't quite catch that — say it again? 💗")
                 continue
 
-            message_id = str(uuid.uuid4())
-            async with SessionLocal() as db:
-                await add_message(
-                    db,
-                    message_id=message_id,
-                    session_id=session_id,
-                    user_id=str(user.id),
-                    tier=tier,
-                    role=MessageRole.USER,
-                    content=text,
-                )
+            # 1) Rate limit — one Lua op. Speak once, then stay quiet (never spam).
+            rl = await limiter.check(uid, policy)
+            if not rl.allowed:
+                if await gate.allow(uid, "rate_limited"):
+                    await notice(say("rate_limited"))
+                continue
+            if rl.approaching and await gate.allow(uid, "approaching"):
+                await notice(say("approaching"))
 
-            # Subscribe BEFORE enqueuing so no early token is dropped.
+            # 2) Safety screen — local, no await. Crisis is answered with care, always.
+            verdict = screener.screen_input(text)
+            if not verdict.safe:
+                if verdict.kind == "crisis":
+                    reply = say("crisis")
+                    await persist(MessageRole.USER, text, mood="tender")
+                    await persist(MessageRole.ASSISTANT, reply, mood="tender")
+                    await notice(reply)
+                elif await gate.allow(uid, verdict.kind):
+                    await notice(say(verdict.kind))
+                continue
+
+            # 3) Passed — persist, subscribe before enqueue, admit.
+            message_id = await persist(MessageRole.USER, text)
             sub = await stream.subscribe(message_id)
             admitted = await lb.admit(
-                message_id=message_id,
-                user_id=str(user.id),
-                session_id=session_id,
-                tier=tier,
-                text=text,
+                message_id=message_id, user_id=uid, session_id=session_id,
+                tier=tier, text=text,
             )
             if not admitted:
                 await sub.aclose()
-                await websocket.send_json({"type": "notice", "message": SHED_NOTICE})
+                if await gate.allow(uid, "overloaded"):
+                    await notice(say("overloaded"))
                 continue
 
             try:
@@ -133,7 +173,7 @@ async def ws_chat(websocket: WebSocket) -> None:
                     elif frame["t"] == "done":
                         await websocket.send_json({"type": "done", "mood": frame.get("mood")})
                     else:
-                        await websocket.send_json({"type": "notice", "message": ERROR_NOTICE})
+                        await notice(say("error"))
             finally:
                 await sub.aclose()
     except WebSocketDisconnect:

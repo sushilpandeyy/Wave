@@ -49,5 +49,14 @@ class Settings:
     # Chance a general worker scans the lowest lane first, so it never starves.
     fairness: float = _float("FAIRNESS", 0.15)
 
+    # --- Graceful rate limiting + notices -------------------------------------
+    # Send one gentle heads-up once remaining tokens drop to this share of burst.
+    approaching_frac: float = _float("APPROACHING_FRAC", 0.2)
+    # Cooldown before the same kind of notice may be spoken to a user again.
+    notice_cooldown_s: int = _int("NOTICE_COOLDOWN_S", 60)
+    # Coarse per-IP connection guard (defense-in-depth; the WS is unauthenticated).
+    ip_rpm: int = _int("IP_RPM", 120)
+    ip_burst: int = _int("IP_BURST", 40)
+
 
 settings = Settings()

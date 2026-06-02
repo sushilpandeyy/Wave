@@ -25,12 +25,15 @@ class TierPolicy:
     base_context: int  # recent messages fed to the model at rest
     base_model: int    # starting index into MODEL_LADDER
     resilience: int    # pressure levels absorbed before degrading (large = never)
+    rpm: int           # sustained requests/min (token bucket refill rate)
+    burst: int         # bucket size — how many back-to-back messages are fine
 
 
 POLICIES: dict[Tier, TierPolicy] = {
-    Tier.PREMIUM_PLUS: TierPolicy("ent", 0, base_context=50, base_model=0, resilience=99),
-    Tier.PREMIUM: TierPolicy("prem", 1, base_context=25, base_model=1, resilience=1),
-    Tier.FREE: TierPolicy("free", 2, base_context=8, base_model=2, resilience=0),
+    # Enterprise limits are set so high it is effectively never rate-limited.
+    Tier.PREMIUM_PLUS: TierPolicy("ent", 0, 50, 0, resilience=99, rpm=600, burst=120),
+    Tier.PREMIUM: TierPolicy("prem", 1, 25, 1, resilience=1, rpm=60, burst=20),
+    Tier.FREE: TierPolicy("free", 2, 8, 2, resilience=0, rpm=15, burst=5),
 }
 
 LANE: dict[Tier, str] = {t: p.lane for t, p in POLICIES.items()}

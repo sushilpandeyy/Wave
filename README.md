@@ -79,3 +79,23 @@ dispatcher.
 
 How it works, the Redis key map, and the algorithms are in
 **[docs/load-balancer.md](docs/load-balancer.md)**.
+
+## Graceful rate limiting & safety
+
+Wave never returns a harsh system message. At the front of the producer path, each message
+passes a per-user **token-bucket rate limit** (one Redis Lua op) and a **safety screen**
+(local, no await) before it's enqueued.
+
+- Over the limit → she says one warm line ("okay okay, I need a tiny breather — give me a
+  moment"), then goes quiet — repeated hits are silenced, never spammed. Subsequent limits =
+  silence (defined behavior).
+- "Approaching" the limit → one gentle "let's pace ourselves" heads-up, still served.
+- Unsafe input → an in-character response, not an error: jailbreaks get a playful deflect,
+  NSFW a gentle boundary, and a **crisis (self-harm) message gets a caring reply** — never a
+  refusal, never silenced. Safety shares the same producer flow and notice gate as rate limiting.
+- Enterprise limits are set so high it's effectively never rate-limited.
+- A coarse **per-IP guard** at connection accept catches floods / rotating fake `user_id`s
+  (the WebSocket is unauthenticated). Volumetric/DoS limiting in production would also sit at
+  the GCP edge (Cloud Armor / the load balancer).
+
+Details in **[docs/safety-rate-limiting.md](docs/safety-rate-limiting.md)**.

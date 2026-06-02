@@ -25,8 +25,13 @@ from app.pool import WorkerSupervisor
 from app.prompt import build_prompt
 from app.queries import add_message, get_personality, recent_messages
 from app.redis import get_redis
+from app.safety import SafetyScreener
 from app.streaming import StreamBus
 from app.tiers import LANES_BY_PRIORITY, degrade
+from app.voice import say
+
+# Stateless after compile — one shared instance per worker process.
+_screener = SafetyScreener()
 
 
 def _lanes(pool: str) -> list[str]:
@@ -104,8 +109,10 @@ class Worker:
                     db, job["session_id"], eff.max_context, exclude_id=message_id
                 )
 
+            # Detect mood up front so it steers the reply (not just the done frame).
+            mood = _detect_mood(job["text"])
             messages = build_prompt(
-                personality=persona, history=history, user_message=job["text"]
+                personality=persona, history=history, user_message=job["text"], mood=mood
             )
 
             chunks: list[str] = []
@@ -114,7 +121,10 @@ class Worker:
                 await self._stream.publish_token(message_id, token)
             reply = "".join(chunks).strip()
 
-            mood = _detect_mood(job["text"])
+            # Output safety net. The mock is trusted, so this only diverges for a real
+            # provider — where you'd moderate the stream incrementally rather than here.
+            if not _screener.screen_output(reply).safe:
+                reply = say("output_blocked")
             async with SessionLocal() as db:
                 await add_message(
                     db,

@@ -40,9 +40,13 @@ Layout (`app/`):
 - `worker.py` — pull loop + container entrypoint (`python -m app.worker`).
   `manager.py` — autoscaler entrypoint (`python -m app.manager`).
 - `queries.py` — reusable Part-1 queries. `prompt.py`, `llm.py` (mock).
-- `api.py` — FastAPI: `WS /ws/chat`, `/healthz`, `/metrics`.
+- `ratelimit.py` — per-user tier-aware token bucket (Lua). `safety.py` — local categorized
+  screener (crisis/jailbreak/nsfw/boundary). `voice.py` — Wave's in-character message pools +
+  `NoticeGate` (anti-spam cooldown). [Part 3]
+- `api.py` — FastAPI: `WS /ws/chat` (rate-limit → safety → admit), `/healthz`, `/metrics`.
 
-Docs: `docs/data-model.md` (Part 1), `docs/load-balancer.md` (Part 2).
+Docs: `docs/data-model.md` (Part 1), `docs/load-balancer.md` (Part 2),
+`docs/safety-rate-limiting.md` (Part 3).
 
 ## Conventions
 
