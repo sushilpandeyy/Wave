@@ -7,7 +7,7 @@ These are the primary queries the pipeline runs, kept in one place so both the A
 
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Message, MessageRole, Personality, Session, Tier, User
@@ -89,6 +89,57 @@ async def add_message(
     await db.commit()
     await db.refresh(msg)
     return msg
+
+
+async def claim_idle_sessions(db: AsyncSession, cutoff: datetime) -> list[tuple]:
+    """Atomically close active sessions idle since `cutoff`, returning what was claimed.
+
+    One `UPDATE … RETURNING` so each session is claimed by exactly one reflector instance.
+    """
+    result = await db.execute(
+        update(Session)
+        .where(Session.status == "active", Session.last_message_at < cutoff)
+        .values(status="closed")
+        .returning(Session.id, Session.user_id, Session.message_count)
+    )
+    rows = result.all()
+    await db.commit()
+    return rows
+
+
+async def session_transcript(db: AsyncSession, session_id: str, limit: int) -> list[Message]:
+    """The session's last `limit` messages, chronological — input to reflection."""
+    rows = (
+        await db.execute(
+            select(Message)
+            .where(Message.session_id == session_id)
+            .order_by(Message.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return list(reversed(rows))
+
+
+async def update_personality(
+    db: AsyncSession, user_id: str, *, traits: dict, summary: str
+) -> None:
+    """Upsert the user's single personality row (updated_at bumps via onupdate)."""
+    p = (
+        await db.execute(select(Personality).where(Personality.user_id == user_id))
+    ).scalar_one_or_none()
+    if p is None:
+        db.add(Personality(user_id=user_id, traits=traits, summary=summary))
+    else:
+        p.traits = traits
+        p.summary = summary
+    await db.commit()
+
+
+async def set_session_title(db: AsyncSession, session_id: str, title: str) -> None:
+    sess = await db.get(Session, session_id)
+    if sess is not None:
+        sess.title = title[:200]
+        await db.commit()
 
 
 async def active_users_by_tier(db: AsyncSession, since: datetime) -> dict[str, int]:

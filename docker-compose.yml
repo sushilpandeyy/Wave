@@ -58,5 +58,16 @@ services:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
 
+  # Reflection plane: close idle sessions + evolve user personalities (background).
+  reflector:
+    build: .
+    command: ["python", "-m", "app.reflector"]
+    environment:
+      POSTGRES_DSN: postgresql+asyncpg://wave:wave@postgres:5432/wave
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
 volumes:
   wave_pg:

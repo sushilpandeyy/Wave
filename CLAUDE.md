@@ -48,12 +48,17 @@ Layout (`app/`):
   background batch flush to Redis, `aclose()` drain. `obs.py` — JSON structured logging
   (QueueHandler/Listener, non-blocking), `corr_id`+context via contextvars, `timed()` slow-op.
   Correlation id = `message_id`, traced api↔worker. [Part 4]
+- `reflection.py` — session-end personality reflection: `SessionReaper` (closes idle sessions,
+  enqueues `wave:reflect`), `reflect_session` (LLM JSON → clamp + α-blend traits → update
+  personality + session title), consumers. `reflector.py` — entrypoint (`python -m app.reflector`).
+  Background only; bad LLM output never corrupts the personality. [Part 5]
 - Safety + mood are **model-driven**: the model emits a flag in its META line; the worker maps a
   non-`none` flag to `voice.say(flag)` (crisis = caring). No regex screener.
 - `api.py` — FastAPI: `WS /ws/chat` (rate-limit → admit), `/healthz`, `/metrics`.
 
 Docs: `docs/data-model.md` (Part 1), `docs/load-balancer.md` (Part 2),
-`docs/safety-rate-limiting.md` (Part 3), `docs/observability.md` (Part 4).
+`docs/safety-rate-limiting.md` (Part 3), `docs/observability.md` (Part 4),
+`docs/reflection.md` (Part 5).
 
 ## Conventions
 

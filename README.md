@@ -118,3 +118,17 @@ cost is an in-memory enqueue.
 - **Graceful shutdown** — on SIGTERM the analytics queue drains and logs flush; no data loss.
 
 Details in **[docs/observability.md](docs/observability.md)**.
+
+## Personality reflection (learning between sessions)
+
+When a conversation goes idle, the `reflector` service closes the session and runs a background
+LLM **reflection** that evolves Wave's per-user model — so the next chat feels continuous.
+
+- A **reaper** atomically claims idle sessions and enqueues the worthwhile ones (`wave:reflect`).
+- Consumers run a JSON reflection over the transcript and update `personalities.traits` +
+  `summary`. Traits are **blended** toward the model's suggestion (learning rate α) so the
+  persona evolves *gradually* — one odd conversation can't swing it, and bad/invalid output
+  never corrupts the stored personality.
+- Entirely off the chat hot path; shuts down draining cleanly.
+
+Details in **[docs/reflection.md](docs/reflection.md)**.

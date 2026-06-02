@@ -13,6 +13,8 @@ Note: the mock LLM ignores prompt content; this is the prompt a real provider wo
 receive (and the static block is structured first so it can be prompt-cached).
 """
 
+import json
+
 from app.llm import Message
 from app.models import Message as ChatMessage
 from app.models import Personality
@@ -133,3 +135,37 @@ def build_prompt(
         messages.append({"role": m.role.value, "content": m.content})
     messages.append({"role": "user", "content": user_message})
     return messages
+
+
+# --- Session-end reflection (personality update) ---------------------------------
+# The trait dimensions Wave tracks per user (each 0.0–1.0).
+TRAIT_KEYS = ("warmth", "humor", "openness", "formality", "playfulness", "supportiveness")
+
+REFLECTION_SYSTEM = (
+    "You maintain Wave's evolving mental model of one person, updated after each conversation. "
+    "Given the PREVIOUS model and the NEW conversation, return an UPDATED model. "
+    "Nudge, don't overhaul — adjust a trait only where the conversation gives real evidence, and "
+    "keep changes small. The summary is long-term memory a close friend would keep: concise, "
+    "factual, the things worth remembering (interests, life context, what matters, the tone they "
+    "like). Merge it with what you already knew and keep it short. "
+    'Return ONLY a JSON object of the form: {"traits": {'
+    + ", ".join(f'"{k}": 0.0-1.0' for k in TRAIT_KEYS)
+    + '}, "summary": "...", "title": "short label for this conversation"}.'
+)
+
+
+def build_reflection_messages(
+    personality: Personality | None, transcript: list[ChatMessage]
+) -> list[Message]:
+    prev_traits = personality.traits if personality and personality.traits else {}
+    prev_summary = (personality.summary if personality else "") or "(nothing remembered yet)"
+    convo = "\n".join(f"{m.role.value}: {m.content}" for m in transcript)
+    user = (
+        f"PREVIOUS traits: {json.dumps(prev_traits)}\n"
+        f"PREVIOUS summary: {prev_summary}\n\n"
+        f"NEW conversation:\n{convo}"
+    )
+    return [
+        {"role": "system", "content": REFLECTION_SYSTEM},
+        {"role": "user", "content": user},
+    ]

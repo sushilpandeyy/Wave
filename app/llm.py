@@ -19,6 +19,12 @@ class CompletionClient(Protocol):
     def stream(self, messages: list[Message], *, model_quality: str) -> AsyncIterator[str]:
         ...
 
+    async def complete(
+        self, messages: list[Message], *, model_quality: str = "standard", json: bool = True
+    ) -> str:
+        """One-shot (non-streamed) completion — used by the reflection pipeline."""
+        ...
+
 
 class GPTClient:
     """Streaming OpenAI chat completions, model chosen by tier quality."""
@@ -46,6 +52,19 @@ class GPTClient:
             if token:
                 yield token
 
+    async def complete(
+        self, messages: list[Message], *, model_quality: str = "standard", json: bool = True
+    ) -> str:
+        kwargs: dict = {}
+        if json:
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = await self._client.chat.completions.create(
+            model=self._model.get(model_quality, settings.model_standard),
+            messages=messages,
+            **kwargs,
+        )
+        return resp.choices[0].message.content or ""
+
 
 # --- Mock fallback ----------------------------------------------------------------
 _TOKEN_DELAY = {"premium": 0.01, "standard": 0.02, "fast": 0.03}
@@ -53,6 +72,13 @@ _TOKEN_DELAY = {"premium": 0.01, "standard": 0.02, "fast": 0.03}
 _MOCK_REPLY = (
     "META|mood=neutral|flag=none\n"
     "hey, I'm here — tell me what's going on?"
+)
+# Canned reflection JSON so the pipeline works offline (no key).
+_MOCK_REFLECTION = (
+    '{"traits": {"warmth": 0.85, "humor": 0.7, "openness": 0.8, "formality": 0.2, '
+    '"playfulness": 0.7, "supportiveness": 0.85}, '
+    '"summary": "Enjoys easy evening chats; opened up about a stressful week at work.", '
+    '"title": "a long day, decompressing"}'
 )
 
 
@@ -64,6 +90,11 @@ class MockCompletionClient:
         for word in _MOCK_REPLY.split(" "):
             await asyncio.sleep(delay)
             yield word + " "
+
+    async def complete(
+        self, messages: list[Message], *, model_quality: str = "standard", json: bool = True
+    ) -> str:
+        return _MOCK_REFLECTION
 
 
 def get_llm() -> CompletionClient:

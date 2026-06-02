@@ -68,6 +68,15 @@ class Settings:
     events_stream_max: int = _int("EVENTS_STREAM_MAX", 10000)        # capped raw-event stream
     shutdown_drain_s: float = _float("SHUTDOWN_DRAIN_S", 5.0)        # bounded drain on exit
 
+    # --- Session-end personality reflection -----------------------------------
+    session_idle_timeout_s: float = _float("SESSION_IDLE_TIMEOUT_S", 1800.0)  # close after idle
+    reaper_interval_s: float = _float("REAPER_INTERVAL_S", 30.0)
+    reflect_min_messages: int = _int("REFLECT_MIN_MESSAGES", 4)   # skip trivial sessions
+    reflect_concurrency: int = _int("REFLECT_CONCURRENCY", 4)     # bound LLM cost/provider load
+    reflect_msg_limit: int = _int("REFLECT_MSG_LIMIT", 100)       # transcript token bound
+    trait_alpha: float = _float("TRAIT_ALPHA", 0.3)              # learning rate (gradual evolve)
+    summary_max_chars: int = _int("SUMMARY_MAX_CHARS", 800)
+
     # --- LLM (OpenAI GPT) -----------------------------------------------------
     # No key → the mock client is used (dev / offline / tests).
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
