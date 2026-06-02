@@ -101,3 +101,20 @@ passes a per-user **token-bucket rate limit** (one Redis Lua op) and a **safety 
   the GCP edge (Cloud Armor / the load balancer).
 
 Details in **[docs/safety-rate-limiting.md](docs/safety-rate-limiting.md)**.
+
+## Observability
+
+Analytics, structured logging, and tracing that never slow the chat path — the only hot-path
+cost is an in-memory enqueue.
+
+- **Analytics** — `track()` is a `put_nowait` on a bounded queue (**~0.36 µs/call**); a
+  background task batches and flushes to Redis. Under pressure it sheds *verbose* events first
+  and keeps critical ones.
+- **Structured logging** — JSON to stdout written off-loop (QueueHandler/Listener); a
+  correlation id (the `message_id`) and context (tier, user, op) are stamped on every line.
+- **Tracing** — milestones `received → enqueued → dequeued → first_token → completed →
+  delivered` let you reconstruct one turn's **round-trip** and its breakdown (queue wait, TTFT,
+  generation) by `corr_id`. `timed()` auto-logs any operation over a threshold.
+- **Graceful shutdown** — on SIGTERM the analytics queue drains and logs flush; no data loss.
+
+Details in **[docs/observability.md](docs/observability.md)**.

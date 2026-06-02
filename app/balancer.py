@@ -53,6 +53,7 @@ class LoadBalancer:
                 "session_id": session_id,
                 "tier": tier.value,
                 "text": text,
+                "enqueued_at": time.time(),  # for queue-wait tracing in the worker
             }
         )
         result = await self._admit(

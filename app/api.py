@@ -7,12 +7,15 @@ Whenever something has to interrupt the chat, Wave replies in her own voice (`ap
 — never a system error — and the NoticeGate keeps us from repeating the same kind of line.
 """
 
+import time
 import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
+from app import obs
+from app.analytics import aclose_analytics, event, start_analytics, stats, track
 from app.balancer import LoadBalancer
 from app.config import settings
 from app.db import SessionLocal
@@ -29,6 +32,8 @@ from app.voice import NoticeGate, say
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    obs.start_logging()
+    start_analytics()
     redis = get_redis()
     app.state.redis = redis
     app.state.lb = LoadBalancer(redis, settings.free_hard_cap)
@@ -36,7 +41,12 @@ async def lifespan(app: FastAPI):
     app.state.health = HealthRegistry(redis)
     app.state.limiter = RateLimiter(redis)
     app.state.gate = NoticeGate(redis)
+    obs.info("api.start")
     yield
+    # Graceful shutdown: flush analytics + logs, then close connections (no data loss).
+    obs.info("api.stop")
+    await aclose_analytics()
+    obs.stop_logging()
     await close_redis()
 
 
@@ -72,6 +82,7 @@ async def metrics() -> dict:
         "circuit_open": circuit == "1",
         "pool_target": {k: int(v) for k, v in target.items()},
         **await health.snapshot(settings.heartbeat_ttl_s),
+        **stats(),
     }
 
 
@@ -112,14 +123,12 @@ async def ws_chat(websocket: WebSocket) -> None:
     async def notice(msg: str) -> None:
         await websocket.send_json({"type": "notice", "message": msg})
 
-    async def persist(role: MessageRole, content: str, mood: str | None = None) -> str:
-        mid = str(uuid.uuid4())
+    async def persist(message_id: str, role: MessageRole, content: str) -> None:
         async with SessionLocal() as db:
             await add_message(
-                db, message_id=mid, session_id=session_id, user_id=uid,
-                tier=tier, role=role, content=content, mood=mood,
+                db, message_id=message_id, session_id=session_id, user_id=uid,
+                tier=tier, role=role, content=content,
             )
-        return mid
 
     try:
         while True:
@@ -129,24 +138,37 @@ async def ws_chat(websocket: WebSocket) -> None:
                 await notice("I didn't quite catch that — say it again?")
                 continue
 
+            # message_id is the correlation id for the whole turn (api + worker).
+            message_id = str(uuid.uuid4())
+            obs.set_corr(message_id)
+            obs.bind(tier=tier.value, user_id=uid, op="chat")
+            t0 = time.perf_counter()
+            event("received", tier=tier.value)
+
             # 1) Rate limit — one Lua op. Speak once, then stay quiet (never spam).
             rl = await limiter.check(uid, policy)
             if not rl.allowed:
+                event("rate_limited", tier=tier.value)
                 if await gate.allow(uid, "rate_limited"):
                     await notice(say("rate_limited"))
                 continue
-            if rl.approaching and await gate.allow(uid, "approaching"):
-                await notice(say("approaching"))
+            if rl.approaching:
+                track("approaching", tier=tier.value)
+                if await gate.allow(uid, "approaching"):
+                    await notice(say("approaching"))
 
             # 2) Persist, subscribe before enqueue, admit. (Safety/mood handled in worker.)
-            message_id = await persist(MessageRole.USER, text)
+            async with obs.timed("persist_user", tier=tier.value):
+                await persist(message_id, MessageRole.USER, text)
             sub = await stream.subscribe(message_id)
-            admitted = await lb.admit(
-                message_id=message_id, user_id=uid, session_id=session_id,
-                tier=tier, text=text,
-            )
+            async with obs.timed("admit", tier=tier.value):
+                admitted = await lb.admit(
+                    message_id=message_id, user_id=uid, session_id=session_id,
+                    tier=tier, text=text,
+                )
             if not admitted:
                 await sub.aclose()
+                event("shed", tier=tier.value)
                 if await gate.allow(uid, "overloaded"):
                     await notice(say("overloaded"))
                 continue
@@ -157,7 +179,12 @@ async def ws_chat(websocket: WebSocket) -> None:
                         await websocket.send_json({"type": "token", "value": frame["v"]})
                     elif frame["t"] == "done":
                         await websocket.send_json({"type": "done", "mood": frame.get("mood")})
+                        event(
+                            "delivered", tier=tier.value,
+                            roundtrip_ms=round((time.perf_counter() - t0) * 1000, 1),
+                        )
                     else:
+                        event("error", tier=tier.value)
                         await notice(say("error"))
             finally:
                 await sub.aclose()

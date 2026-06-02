@@ -44,12 +44,16 @@ Layout (`app/`):
   streaming) + `MockCompletionClient`; `get_llm()` falls back to mock when no `OPENAI_API_KEY`.
 - `ratelimit.py` — per-user tier-aware token bucket (Lua) + per-IP guard. `voice.py` — Wave's
   in-character message pools + `NoticeGate` (anti-spam cooldown). [Part 3]
+- `analytics.py` — non-blocking event pipeline: `track()` (put_nowait, <1ms, intelligent drop),
+  background batch flush to Redis, `aclose()` drain. `obs.py` — JSON structured logging
+  (QueueHandler/Listener, non-blocking), `corr_id`+context via contextvars, `timed()` slow-op.
+  Correlation id = `message_id`, traced api↔worker. [Part 4]
 - Safety + mood are **model-driven**: the model emits a flag in its META line; the worker maps a
   non-`none` flag to `voice.say(flag)` (crisis = caring). No regex screener.
 - `api.py` — FastAPI: `WS /ws/chat` (rate-limit → admit), `/healthz`, `/metrics`.
 
 Docs: `docs/data-model.md` (Part 1), `docs/load-balancer.md` (Part 2),
-`docs/safety-rate-limiting.md` (Part 3).
+`docs/safety-rate-limiting.md` (Part 3), `docs/observability.md` (Part 4).
 
 ## Conventions
 

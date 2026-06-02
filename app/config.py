@@ -58,6 +58,16 @@ class Settings:
     ip_rpm: int = _int("IP_RPM", 120)
     ip_burst: int = _int("IP_BURST", 40)
 
+    # --- Observability --------------------------------------------------------
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    slow_op_ms: float = _float("SLOW_OP_MS", 250.0)     # auto-WARN above this
+    analytics_queue_max: int = _int("ANALYTICS_QUEUE_MAX", 10000)
+    analytics_watermark: float = _float("ANALYTICS_WATERMARK", 0.8)  # shed verbose past this
+    analytics_batch: int = _int("ANALYTICS_BATCH", 200)
+    analytics_flush_ms: float = _float("ANALYTICS_FLUSH_MS", 250.0)  # max linger before flush
+    events_stream_max: int = _int("EVENTS_STREAM_MAX", 10000)        # capped raw-event stream
+    shutdown_drain_s: float = _float("SHUTDOWN_DRAIN_S", 5.0)        # bounded drain on exit
+
     # --- LLM (OpenAI GPT) -----------------------------------------------------
     # No key → the mock client is used (dev / offline / tests).
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
