@@ -24,41 +24,41 @@ lower tiers — without ever sounding technical or robotic to the end user.
 
 ## Stack
 
-FastAPI · PostgreSQL (SQLAlchemy async + asyncpg) · Redis · structlog · Docker Compose.
+FastAPI · PostgreSQL (SQLAlchemy async + asyncpg) · Redis · Docker Compose.
+(Current code = DB layer only — see below.)
 
-## Layout
+## Current state — DB layer only
 
-- `app/core/` — config, logging, and `tiers.py` (the single `POLICIES` table where
-  all per-tier behavior lives: rate limits, queue lane, priority, context budget,
-  timeout, model quality).
-- `app/services/` — `rate_limit` (Redis token bucket), `router` (per-lane Redis
-  sorted set), `chat`, `prompt`, `llm` (`MockCompletionClient` today), `safety`,
-  `streaming` (Redis pub/sub), `analytics`, `registry`.
-- `app/workers/` — in-process asyncio worker pool + `WorkerManager` (autoscale,
-  heartbeat, idle retirement).
-- `app/db/` — `postgres.py`, `redis.py`.
-- `app/models/` + `app/schemas/` — SQLAlchemy models and Pydantic schemas.
-- `app/api/chat.py` — WebSocket chat endpoint.
-- `scripts/seed.py` — seeds one demo user per tier.
+The repo is intentionally stripped down to **Part 1 (Data Modeling & Query Design)**.
+The earlier pipeline (api/services/workers/routing) was removed and will be rebuilt
+later. Only the database layer exists right now:
 
-See `README.md` for the architecture diagram and run instructions.
+- `app/db.py` — async SQLAlchemy `Base`, engine, `SessionLocal`, `get_session`
+  (DSN from `POSTGRES_DSN`).
+- `app/models.py` — the four models (`User`, `Personality`, `Session`, `Message`)
+  with the `Tier` / `MessageRole` enums and all indexes.
+- `scripts/init_db.py` — `create_all` helper.
+
+The schema, indexes, and core queries are documented in `README.md`
+("Data Modeling & Query Design").
 
 ## Conventions
 
-- Keep all I/O async — no blocking calls in request or worker paths.
-- All tier-specific behavior belongs in `app/core/tiers.py::POLICIES`, not scattered
-  through services.
-- User-facing safety/rate-limit messages must be warm and non-technical (see
-  `app/services/safety.py` fallbacks).
-- Config knobs are env-overridable with defaults in `app/core/config.py`.
+- Keep all I/O async — no blocking calls.
+- `tier` is a first-class column on `users` (and denormalized onto `messages`),
+  never buried in JSON.
+- A **session** is one conversation episode; ≤1 active session per user (enforced by
+  a partial unique index).
 
 ## Run locally
 
+Needs a Postgres with a `wave` role + `wave` db (the default `POSTGRES_DSN`). A local
+`.pgdata` cluster works — no Docker required:
+
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-docker compose up -d            # postgres + redis
-.venv/bin/python -m scripts.seed
-.venv/bin/uvicorn app.main:app --reload
+pg_ctl -D .pgdata -l pg.log start   # (initdb -U wave -D .pgdata first time)
+pip install -r requirements.txt
+python -m scripts.init_db           # create tables + indexes
 ```
 
-Health: `GET /healthz` · Metrics: `GET /metrics` · Chat: `ws://127.0.0.1:8000/ws/chat?user_id=<id>&session=demo`
+Docker is optional: `docker compose up -d` is an alternative to the local cluster.

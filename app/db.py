@@ -1,3 +1,9 @@
+"""Async SQLAlchemy setup: engine, session factory, and the ORM base.
+
+All I/O is non-blocking (asyncpg + asyncio). The DSN comes from POSTGRES_DSN.
+"""
+
+import os
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import (
@@ -7,29 +13,23 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
-from app.core.config import settings
+POSTGRES_DSN = os.getenv(
+    "POSTGRES_DSN", "postgresql+asyncpg://wave:wave@localhost:5432/wave"
+)
 
 
 class Base(DeclarativeBase):
     """Base class for all ORM models."""
 
 
-engine = create_async_engine(
-    settings.postgres_dsn,
-    pool_size=settings.db_pool_size,
-    max_overflow=settings.db_max_overflow,
-    pool_pre_ping=True,
-    echo=settings.debug,
-)
+engine = create_async_engine(POSTGRES_DSN, pool_pre_ping=True)
 
 SessionLocal = async_sessionmaker(
-    bind=engine,
-    expire_on_commit=False,
-    class_=AsyncSession,
+    bind=engine, expire_on_commit=False, class_=AsyncSession
 )
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency yielding a scoped async session."""
+    """Yield a scoped async session."""
     async with SessionLocal() as session:
         yield session

@@ -1,76 +1,60 @@
-# Wave — Message Processing Pipeline
+# Wave
 
-FastAPI + PostgreSQL + Redis backend for the Wave AI companion. Handles tiered
-chat completion: rate limiting, priority routing, an autoscaling worker pool,
-safety handling, and live analytics — with graceful degradation for lower tiers.
+**Wave** is an AI companion chatbot with subscription tiers (`free`, `premium`,
+`premium++`), built on FastAPI + PostgreSQL + Redis.
 
-## Architecture
+> This stage is the **database layer only** — schema, indexes, and the core queries
+> for Part 1 (Data Modeling & Query Design). The rest of the pipeline comes later.
 
-```
-WS client ──► /ws/chat ──► ChatService ──► [rate limit] ──► [safety in]
-                 ▲                              │
-                 │ stream tokens                ▼
-          Redis pub/sub                 persist user Chat row
-        wave:stream:{msg_id}                    │
-                 ▲                               ▼
-                 │                     enqueue → Redis ZSET lane (high|low)
-                 │                               │
-                 │              ┌────────────────┴──────────── pull (BZPOPMIN)
-          WorkerManager ──► [ Worker pool: asyncio tasks ]
-        (autoscale + heartbeat)         build prompt → mock LLM stream
-                                        → safety out → persist assistant Chat
-```
+## Quickstart
 
-- **Tiers** (`app/core/tiers.py`): `free`, `premium`, `premium++`. All
-  per-tier behavior (rate limits, queue lane, priority, context budget, timeout,
-  model quality) lives in one `POLICIES` table. Tier is read from
-  `users.profile["tier"]`.
-- **Rate limiting** (`app/services/rate_limit.py`): atomic Redis token bucket.
-- **Routing** (`app/services/router.py`): per-lane Redis sorted set; premium
-  tiers ride the HIGH lane, free rides LOW. Workers pull HIGH-first.
-- **Workers** (`app/workers/`): in-process asyncio pool. `WorkerManager`
-  autoscales between `min_workers` and `max_workers` on queue depth / job age,
-  retires idle workers, and prunes dead heartbeats.
-- **Streaming** (`app/services/streaming.py`): worker → client token streaming
-  over Redis pub/sub, forwarded to the WebSocket.
-- **Safety** (`app/services/safety.py`): pluggable input/output screening with
-  warm, non-technical fallbacks.
-- **Analytics** (`app/services/analytics.py`): per-minute Redis counters.
-- **LLM** (`app/services/llm.py`): `MockCompletionClient` for now; swap in a real
-  provider by implementing `CompletionClient.stream`.
-
-## Run locally
+You need a Postgres with a `wave` role and `wave` database (the default `POSTGRES_DSN`;
+override it via env or `.env`).
 
 ```bash
-# 1. Dependencies
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# Local Postgres — no Docker:
+pg_ctl -D .pgdata -l pg.log start    # first time: initdb -U wave -D .pgdata && createdb -U wave wave
 
-# 2. Data stores
-docker compose up -d            # postgres + redis
-
-# 3. Seed demo users (one per tier)
-.venv/bin/python -m scripts.seed
-
-# 4. Start the API (tables auto-create on startup in dev)
-.venv/bin/uvicorn app.main:app --reload
+pip install -r requirements.txt
+python -m scripts.init_db            # creates tables + indexes
 ```
 
-Health: `GET /healthz` · Live metrics: `GET /metrics`
+> Prefer Docker? `docker compose up -d` replaces the `pg_ctl` step.
 
-### Talk to it (WebSocket)
+---
 
-Connect to `ws://127.0.0.1:8000/ws/chat?user_id=<id>&session=demo` and send
-`{"message": "..."}`. You'll receive a stream of `token` frames, then a `done`
-frame — or a `notice` frame when rate-limited or safety-blocked.
+## Data model
 
-## Configuration
+Four tables, related like this:
 
-All knobs are env-overridable; defaults live in `app/core/config.py`
-(worker counts, autoscale thresholds, heartbeat TTL, etc.). See `.env.example`.
+```
+users ──1:1── personalities
+  │
+  └──1:N── sessions ──1:N── messages
+```
 
-## Notes / out of scope (next steps)
+| Table | What it holds | Columns |
+|---|---|---|
+| **users** | account + subscription tier | `id`, `display_name`, `tier`, `locale`, `timezone`, `last_active_at`, `settings` (jsonb), `created_at` |
+| **personalities** | the companion's persona, one per user | `id`, `user_id` (unique), `traits` (jsonb), `summary`, `updated_at`, `created_at` |
+| **sessions** | one conversation episode | `id`, `user_id`, `status` (`active`\|`closed`), `title`, `message_count`, `last_message_at`, `created_at` |
+| **messages** | a single chat turn | `id`, `session_id`, `user_id`, `tier`, `role` (`user`\|`assistant`\|`system`), `content`, `mood`, `created_at` |
 
-- Real LLM provider (mock today; one class to swap).
-- AuthN/AuthZ (a trusted `user_id` is assumed for now).
-- Alembic migrations (dev uses `create_all`).
-- Separate worker processes / k8s HPA (the in-process pool simulates scaling).
+## Decisions we made (and why)
+
+- **A "session" is one conversation *episode*.** A user has **at most one active
+  session** at a time; a new one opens after the previous closes. Clean unit for
+  scoping context and answering "what are we talking about right now."
+- **`tier` is a real column, not JSON.** It's read on every message and grouped on in
+  analytics — a typed column gets an index and a cheap `GROUP BY`; a JSON blob doesn't.
+- **`messages` carries its own `user_id` and `tier`.** Denormalized on purpose: the hot
+  reads and per-tier counts never have to join back to `sessions`/`users`. `tier` is the
+  tier *at send time*, which is what those counts actually want.
+- **One personality per user, updated in place.** Kept simple for now (versioning can
+  come later if we want to track how a persona evolved).
+- **Defaults live in the database**, not just the ORM — so plain SQL inserts work too.
+- **UUID primary keys, `timestamptz` everywhere (UTC).** `mood` is nullable until a
+  message is classified.
+
+Indexes and the exact query patterns (with performance notes) live in
+**[docs/data-model.md](docs/data-model.md)**.
