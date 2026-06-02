@@ -1,7 +1,8 @@
 # Wave
 
 **Wave** is an AI companion chatbot with subscription tiers (`free`, `premium`,
-`premium++`), built on FastAPI + PostgreSQL + Redis.
+`premium++`), built on FastAPI + PostgreSQL + Redis, with OpenAI GPT for completions
+(set `OPENAI_API_KEY`; without it a mock client is used so everything runs offline).
 
 Built so far: **Part 1** (data model — schema, indexes, queries) and **Part 2** (the
 tier-aware load balancer — routing, worker pools, autoscaling, and load shedding).
@@ -90,9 +91,10 @@ passes a per-user **token-bucket rate limit** (one Redis Lua op) and a **safety 
   moment"), then goes quiet — repeated hits are silenced, never spammed. Subsequent limits =
   silence (defined behavior).
 - "Approaching" the limit → one gentle "let's pace ourselves" heads-up, still served.
-- Unsafe input → an in-character response, not an error: jailbreaks get a playful deflect,
-  NSFW a gentle boundary, and a **crisis (self-harm) message gets a caring reply** — never a
-  refusal, never silenced. Safety shares the same producer flow and notice gate as rate limiting.
+- Unsafe input → an in-character response, not an error. Detection is **model-driven**: the
+  model emits a control flag (`jailbreak` / `nsfw` / `boundary` / `crisis`) and the app swaps in
+  Wave's matching line — jailbreaks get a playful deflect, NSFW a gentle boundary, and a
+  **crisis (self-harm) message gets a caring reply**. No brittle keyword regex.
 - Enterprise limits are set so high it's effectively never rate-limited.
 - A coarse **per-IP guard** at connection accept catches floods / rotating fake `user_id`s
   (the WebSocket is unauthenticated). Volumetric/DoS limiting in production would also sit at

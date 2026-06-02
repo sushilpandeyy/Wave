@@ -1,10 +1,10 @@
 """FastAPI app: the producer side of the pipeline.
 
-A WebSocket chat endpoint plus health/metrics. Per message the hot path is, in order
-and short-circuiting on the first stop: one rate-limit Lua op, a local safety screen
-(no await), then persist + subscribe + atomic admit. Whenever something has to interrupt
-the chat, Wave replies in her own voice (`app/voice.py`) — never a system error — and the
-NoticeGate keeps us from saying the same kind of thing twice in a row.
+A WebSocket chat endpoint plus health/metrics. Per message the producer path is tight:
+one rate-limit Lua op, then persist + subscribe + atomic admit. Safety + mood are decided
+by the model in the worker (it emits a control flag), so there's no screening here.
+Whenever something has to interrupt the chat, Wave replies in her own voice (`app/voice.py`)
+— never a system error — and the NoticeGate keeps us from repeating the same kind of line.
 """
 
 import uuid
@@ -22,7 +22,6 @@ from app.pool import CIRCUIT_KEY, TARGET_KEY
 from app.queries import add_message, get_or_open_session
 from app.ratelimit import RateLimiter
 from app.redis import close_redis, get_redis
-from app.safety import SafetyScreener
 from app.streaming import StreamBus
 from app.tiers import POLICIES
 from app.voice import NoticeGate, say
@@ -37,7 +36,6 @@ async def lifespan(app: FastAPI):
     app.state.health = HealthRegistry(redis)
     app.state.limiter = RateLimiter(redis)
     app.state.gate = NoticeGate(redis)
-    app.state.screener = SafetyScreener()
     yield
     await close_redis()
 
@@ -110,7 +108,6 @@ async def ws_chat(websocket: WebSocket) -> None:
     stream: StreamBus = app.state.stream
     limiter: RateLimiter = app.state.limiter
     gate: NoticeGate = app.state.gate
-    screener: SafetyScreener = app.state.screener
 
     async def notice(msg: str) -> None:
         await websocket.send_json({"type": "notice", "message": msg})
@@ -129,7 +126,7 @@ async def ws_chat(websocket: WebSocket) -> None:
             raw = await websocket.receive_json()
             text = (raw or {}).get("message")
             if not isinstance(text, str) or not text.strip():
-                await notice("I didn't quite catch that — say it again? 💗")
+                await notice("I didn't quite catch that — say it again?")
                 continue
 
             # 1) Rate limit — one Lua op. Speak once, then stay quiet (never spam).
@@ -141,19 +138,7 @@ async def ws_chat(websocket: WebSocket) -> None:
             if rl.approaching and await gate.allow(uid, "approaching"):
                 await notice(say("approaching"))
 
-            # 2) Safety screen — local, no await. Crisis is answered with care, always.
-            verdict = screener.screen_input(text)
-            if not verdict.safe:
-                if verdict.kind == "crisis":
-                    reply = say("crisis")
-                    await persist(MessageRole.USER, text, mood="tender")
-                    await persist(MessageRole.ASSISTANT, reply, mood="tender")
-                    await notice(reply)
-                elif await gate.allow(uid, verdict.kind):
-                    await notice(say(verdict.kind))
-                continue
-
-            # 3) Passed — persist, subscribe before enqueue, admit.
+            # 2) Persist, subscribe before enqueue, admit. (Safety/mood handled in worker.)
             message_id = await persist(MessageRole.USER, text)
             sub = await stream.subscribe(message_id)
             admitted = await lb.admit(

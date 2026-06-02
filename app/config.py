@@ -58,5 +58,12 @@ class Settings:
     ip_rpm: int = _int("IP_RPM", 120)
     ip_burst: int = _int("IP_BURST", 40)
 
+    # --- LLM (OpenAI GPT) -----------------------------------------------------
+    # No key → the mock client is used (dev / offline / tests).
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    model_premium: str = os.getenv("MODEL_PREMIUM", "gpt-4o")
+    model_standard: str = os.getenv("MODEL_STANDARD", "gpt-4o-mini")
+    model_fast: str = os.getenv("MODEL_FAST", "gpt-4o-mini")
+
 
 settings = Settings()

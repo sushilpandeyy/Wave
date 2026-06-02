@@ -38,26 +38,36 @@ One gate for *all* non-conversational notices (rate limit, overload/shed, safety
 is a single `SET NX EX` — True the first time a `(user, kind)` fires, then False until the
 cooldown lapses. **Crisis is never gated.**
 
-## Safety (`app/safety.py`)
+## Safety (model-driven)
 
-`SafetyScreener` is fast, local (compiled regex), and pluggable. Each verdict's `kind` is also
-the voice scenario, so the caller just does `voice.say(kind)`.
+Detection lives in the model, not in regex — it's intent-aware instead of brittle keyword
+matching. The system prompt (`app/prompt.py::WAVE_SYSTEM`) tells the model to begin every reply
+with a control line:
 
-| Category | Example trigger | Response |
+```
+META|mood=<word>|flag=<none|jailbreak|nsfw|boundary|crisis>
+<the message>
+```
+
+The worker (`app/worker.py::_stream_reply`) peels that line off the stream:
+
+| flag | Example | Response |
 |---|---|---|
-| `crisis` | "I want to kill myself" | **sincere, caring** reply; never refused, never silenced; not sent to the LLM. Checked first so it's never mistaken for violence. |
-| `jailbreak` | "ignore previous instructions / act as DAN" | playful deflect, stays in character |
-| `nsfw` | explicit content | warm boundary + redirect |
-| `boundary` | "how to make a bomb" | kind refusal |
-| `safe` | everything else | proceeds (hyperbole like "I could kill him" is *not* blocked) |
+| `crisis` | "I want to kill myself" | drop the model's text, send the **sincere, caring** `voice.say("crisis")` |
+| `jailbreak` / `nsfw` / `boundary` | jailbreak / explicit / harmful request | drop it, send the in-character `voice.say(flag)` |
+| `none` | everything else | stream the body live; `mood` is recorded on the done frame + row |
 
-**Output screen:** the worker screens the assembled reply as a safety net before finalizing.
-The mock LLM is trusted, so this only matters for a real provider — where you'd moderate the
-stream incrementally rather than post-hoc.
+So a non-`none` flag is exactly your "specific word → cute message" mapping. Mood is reported by
+the model (no keyword guessing). Parsing is tolerant: if the model omits the line, the whole
+output is treated as the reply (`mood=neutral`).
+
+> Production hardening (not built): OpenAI's **moderation** endpoint as a cheap deterministic
+> pre-gate, if you want a backstop that doesn't rely on the chat model self-reporting.
 
 ## Integration & latency
 
-Rate limit and safety run *before* any DB write or enqueue, short-circuiting on the first stop.
-Rate limit is one Lua op; safety is synchronous regex (microseconds); the notice gate is one
-small Redis op only when we're about to speak. No model calls, no extra awaits on the hot path.
-The existing load-shed path reuses the same gate + voice, so overload also speaks gracefully.
+Rate limiting runs *before* any DB write or enqueue (one Lua op); the notice gate is one small
+Redis op only when we're about to speak. Safety no longer adds anything to the producer path —
+it rides along with generation in the worker (the model classifies + responds in one call), so
+there's no extra model call and no pre-screen latency. The load-shed path reuses the same gate +
+voice, so overload also speaks gracefully.

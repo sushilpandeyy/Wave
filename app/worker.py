@@ -1,8 +1,12 @@
 """Pull-based worker + the worker-container entrypoint.
 
-Each worker is an asyncio coroutine. Its loop is deliberately tight: one pipelined
-heartbeat-and-pressure read, one blocking BZPOPMIN, then process. No polling, no
-speculative reads, metrics written once per job.
+Each worker is an asyncio coroutine. Its loop is tight: one pipelined heartbeat-and-pressure
+read, one blocking BZPOPMIN, then process.
+
+Safety + mood are decided by the model, not regex. The model's reply begins with a control
+line `META|mood=..|flag=..` (see WAVE_SYSTEM). We parse that prefix off the stream: a non-`none`
+flag means we drop the reply and send Wave's in-character line (crisis = caring); otherwise we
+stream the body live and record the reported mood.
 
 Run a worker container with:  python -m app.worker
 """
@@ -19,19 +23,18 @@ from app.balancer import PRESSURE_KEY, LoadBalancer
 from app.config import settings
 from app.db import SessionLocal
 from app.health import WORKERS_KEY, HealthRegistry
-from app.llm import MockCompletionClient
+from app.llm import CompletionClient, get_llm
 from app.models import MessageRole, Tier
 from app.pool import WorkerSupervisor
 from app.prompt import build_prompt
 from app.queries import add_message, get_personality, recent_messages
 from app.redis import get_redis
-from app.safety import SafetyScreener
 from app.streaming import StreamBus
 from app.tiers import LANES_BY_PRIORITY, degrade
 from app.voice import say
 
-# Stateless after compile — one shared instance per worker process.
-_screener = SafetyScreener()
+# Flag values the model may emit; non-"none" maps 1:1 to a voice scenario.
+_FLAGS = {"none", "jailbreak", "nsfw", "boundary", "crisis"}
 
 
 def _lanes(pool: str) -> list[str]:
@@ -48,13 +51,18 @@ def _lanes(pool: str) -> list[str]:
     return LANES_BY_PRIORITY
 
 
-def _detect_mood(text: str) -> str:
-    low = text.lower()
-    if any(w in low for w in ("sad", "lonely", "tired", "hurt", "anxious")):
-        return "tender"
-    if any(w in low for w in ("happy", "great", "excited", "love", "good")):
-        return "upbeat"
-    return "neutral"
+def _parse_meta(line: str) -> tuple[str, str]:
+    """Parse `META|mood=<m>|flag=<f>`. Tolerant: returns (neutral, none) if malformed."""
+    mood, flag = "neutral", "none"
+    if line.startswith("META|"):
+        for part in line.split("|")[1:]:
+            key, _, val = part.partition("=")
+            val = val.strip()
+            if key == "mood" and val:
+                mood = val
+            elif key == "flag" and val in _FLAGS:
+                flag = val
+    return mood, flag
 
 
 class Worker:
@@ -63,7 +71,7 @@ class Worker:
         worker_id: str,
         worker_class: str,
         redis: Redis,
-        llm: MockCompletionClient,
+        llm: CompletionClient,
     ):
         self.id = worker_id
         self._class = worker_class
@@ -108,23 +116,12 @@ class Worker:
                 history = await recent_messages(
                     db, job["session_id"], eff.max_context, exclude_id=message_id
                 )
-
-            # Detect mood up front so it steers the reply (not just the done frame).
-            mood = _detect_mood(job["text"])
             messages = build_prompt(
-                personality=persona, history=history, user_message=job["text"], mood=mood
+                personality=persona, history=history, user_message=job["text"]
             )
 
-            chunks: list[str] = []
-            async for token in self._llm.stream(messages, model_quality=eff.model_quality):
-                chunks.append(token)
-                await self._stream.publish_token(message_id, token)
-            reply = "".join(chunks).strip()
+            mood, reply = await self._stream_reply(message_id, messages, eff.model_quality)
 
-            # Output safety net. The mock is trusted, so this only diverges for a real
-            # provider — where you'd moderate the stream incrementally rather than here.
-            if not _screener.screen_output(reply).safe:
-                reply = say("output_blocked")
             async with SessionLocal() as db:
                 await add_message(
                     db,
@@ -145,10 +142,51 @@ class Worker:
         finally:
             await self._health.job_finished(latency_s=time.time() - t0, ok=ok)
 
+    async def _stream_reply(
+        self, message_id: str, messages: list[dict], model_quality: str
+    ) -> tuple[str, str]:
+        """Stream the model reply, peeling off the META control line first.
+
+        Returns (mood, persisted_reply). A safety flag short-circuits to a voice line.
+        """
+        buffer = ""
+        meta_done = False
+        mood, flag = "neutral", "none"
+        body: list[str] = []
+
+        async for token in self._llm.stream(messages, model_quality=model_quality):
+            if not meta_done:
+                buffer += token
+                if "\n" not in buffer:
+                    continue
+                first_line, _, rest = buffer.partition("\n")
+                mood, flag = _parse_meta(first_line)
+                meta_done = True
+                if flag != "none":
+                    break  # unsafe — discard the body, send Wave's line instead
+                if rest:
+                    body.append(rest)
+                    await self._stream.publish_token(message_id, rest)
+                continue
+            body.append(token)
+            await self._stream.publish_token(message_id, token)
+
+        if flag != "none":
+            reply = say(flag)  # jailbreak/nsfw/boundary deflect, crisis = caring
+            await self._stream.publish_token(message_id, reply)
+            return mood, reply
+
+        # Tolerant fallback: model ignored the format (no META line) → it's all reply.
+        reply = ("".join(body) if meta_done else buffer).strip()
+        if not reply:
+            reply = say("error")
+            await self._stream.publish_token(message_id, reply)
+        return mood, reply
+
 
 async def main() -> None:
     redis = get_redis()
-    llm = MockCompletionClient()
+    llm = get_llm()
     container_id = os.getenv("HOSTNAME") or f"worker-{uuid.uuid4().hex[:8]}"
 
     async def make_worker(worker_id: str, worker_class: str):

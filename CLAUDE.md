@@ -39,11 +39,14 @@ Layout (`app/`):
 - `health.py` — heartbeats/in-flight/latency. `pool.py` — `Autoscaler` + `WorkerSupervisor`.
 - `worker.py` — pull loop + container entrypoint (`python -m app.worker`).
   `manager.py` — autoscaler entrypoint (`python -m app.manager`).
-- `queries.py` — reusable Part-1 queries. `prompt.py`, `llm.py` (mock).
-- `ratelimit.py` — per-user tier-aware token bucket (Lua). `safety.py` — local categorized
-  screener (crisis/jailbreak/nsfw/boundary). `voice.py` — Wave's in-character message pools +
-  `NoticeGate` (anti-spam cooldown). [Part 3]
-- `api.py` — FastAPI: `WS /ws/chat` (rate-limit → safety → admit), `/healthz`, `/metrics`.
+- `queries.py` — reusable Part-1 queries. `prompt.py` — `WAVE_SYSTEM` (anti-AI human-authenticity
+  rules) + the `META|mood=..|flag=..` control-line contract. `llm.py` — `GPTClient` (OpenAI
+  streaming) + `MockCompletionClient`; `get_llm()` falls back to mock when no `OPENAI_API_KEY`.
+- `ratelimit.py` — per-user tier-aware token bucket (Lua) + per-IP guard. `voice.py` — Wave's
+  in-character message pools + `NoticeGate` (anti-spam cooldown). [Part 3]
+- Safety + mood are **model-driven**: the model emits a flag in its META line; the worker maps a
+  non-`none` flag to `voice.say(flag)` (crisis = caring). No regex screener.
+- `api.py` — FastAPI: `WS /ws/chat` (rate-limit → admit), `/healthz`, `/metrics`.
 
 Docs: `docs/data-model.md` (Part 1), `docs/load-balancer.md` (Part 2),
 `docs/safety-rate-limiting.md` (Part 3).
