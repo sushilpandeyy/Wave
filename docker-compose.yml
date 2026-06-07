@@ -66,6 +66,11 @@ services:
       POSTGRES_DSN: postgresql+asyncpg://wave:wave@postgres:5432/wave
       REDIS_URL: redis://redis:6379/0
       WORKERS_PER_CONTAINER: "16"
+      # LLM: read from the project .env (no key -> mock client).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MODEL_PREMIUM: ${MODEL_PREMIUM:-gpt-4o}
+      MODEL_STANDARD: ${MODEL_STANDARD:-gpt-4o-mini}
+      MODEL_FAST: ${MODEL_FAST:-gpt-4o-mini}
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -78,6 +83,11 @@ services:
     environment:
       POSTGRES_DSN: postgresql+asyncpg://wave:wave@postgres:5432/wave
       REDIS_URL: redis://redis:6379/0
+      # LLM: read from the project .env (no key -> mock client).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MODEL_PREMIUM: ${MODEL_PREMIUM:-gpt-4o}
+      MODEL_STANDARD: ${MODEL_STANDARD:-gpt-4o-mini}
+      MODEL_FAST: ${MODEL_FAST:-gpt-4o-mini}
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
