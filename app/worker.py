@@ -180,6 +180,15 @@ class Worker:
         async for token in self._llm.stream(messages, model_quality=model_quality):
             if not meta_done:
                 buffer += token
+                # Only keep withholding while the buffer could still be the META control
+                # line. If the model skipped it (common for short replies), start streaming
+                # immediately instead of waiting for a newline that never comes.
+                looks_like_meta = buffer.startswith("META|") or "META|".startswith(buffer)
+                if not looks_like_meta:
+                    meta_done = True
+                    body.append(buffer)
+                    await emit(buffer)
+                    continue
                 if "\n" not in buffer:
                     continue
                 first_line, _, rest = buffer.partition("\n")
@@ -199,7 +208,9 @@ class Worker:
             await emit(reply)
             return mood, reply
 
-        reply = ("".join(body) if meta_done else buffer).strip()
+        # body holds everything already emitted (in both the META and no-META paths).
+        # An empty body means the model sent only an (unterminated) control line.
+        reply = "".join(body).strip()
         if not reply:
             reply = say("error")
             await emit(reply)
