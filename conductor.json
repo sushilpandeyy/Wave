@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "setup": "python3 -m venv .venv && .venv/bin/pip install --quiet --upgrade pip && .venv/bin/pip install --quiet -r requirements.txt && { [ -f .env ] || cp .env.example .env; } && { [ -d wave-mobile ] && npm --prefix wave-mobile install || echo 'wave-mobile not present in this workspace, skipping mobile setup'; }",
+    "setup": "python3 -m venv .venv && .venv/bin/pip install --quiet --upgrade pip && .venv/bin/pip install --quiet -r requirements.txt && { [ -f .env ] || cp .env.example .env; } && if [ -d wave-mobile ]; then npm --prefix wave-mobile install; else echo 'wave-mobile not present in this workspace, skipping mobile setup'; fi",
     "run": "docker compose up --build --scale worker=3",
     "archive": "docker compose down -v --remove-orphans"
   },
