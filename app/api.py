@@ -12,6 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app import obs
@@ -50,7 +51,84 @@ async def lifespan(app: FastAPI):
     await close_redis()
 
 
-app = FastAPI(title="Wave", lifespan=lifespan)
+DESCRIPTION = """
+**Wave** — the backend message-processing pipeline for the Wave AI companion.
+
+This service is the *producer* side of the pipeline: it accepts chat messages over a
+WebSocket, applies tier-aware rate limiting, persists the turn, and atomically admits it
+onto the tier-aware load balancer. Worker processes consume the queues, call the model,
+and stream tokens back over a Redis pub/sub bus. Safety and mood are model-driven (the
+worker maps the model's control flag to Wave's voice), so there is no screening here.
+
+### Endpoints
+- **`WS /ws/chat`** — the chat stream. *WebSocket endpoints are not rendered by Swagger UI;*
+  the full frame contract is documented below.
+- **`GET /healthz`** — liveness probe.
+- **`GET /metrics`** — live pipeline snapshot (queue depth, pressure, pools, health, analytics).
+
+### WebSocket contract — `WS /ws/chat?user_id=<uuid>`
+Connect with a `user_id` query param identifying an existing user (tier is resolved once
+per connection). Then exchange JSON frames:
+
+**Client → server**
+```json
+{ "message": "hey, how are you?" }
+```
+
+**Server → client** (one of):
+```json
+{ "type": "token",  "value": "partial text chunk" }   // streamed model tokens
+{ "type": "done",   "mood": "warm" }                  // turn complete
+{ "type": "notice", "message": "..." }                // in-voice notice (rate limit, overload, error)
+```
+Notices are always spoken in Wave's voice — never a raw system error — and an anti-spam
+gate prevents repeating the same kind of notice. Unknown users and IP-flood rejections
+receive a single `notice` frame, after which the socket is closed.
+"""
+
+TAGS_METADATA = [
+    {"name": "chat", "description": "The WebSocket chat stream (producer path)."},
+    {"name": "ops", "description": "Operational endpoints: health probes and live metrics."},
+]
+
+app = FastAPI(
+    title="Wave",
+    version="1.0.0",
+    summary="AI companion message-processing pipeline.",
+    description=DESCRIPTION,
+    openapi_tags=TAGS_METADATA,
+    lifespan=lifespan,
+)
+
+
+class HealthResponse(BaseModel):
+    """Liveness probe payload."""
+
+    status: str = Field("ok", examples=["ok"])
+
+
+class MetricsResponse(BaseModel):
+    """Live snapshot of the pipeline. Fields are merged from the load balancer,
+    health registry, and analytics stats, so the exact key set can grow over time."""
+
+    queues: dict[str, int] = Field(
+        description="Current depth per priority queue (priority / standard / elastic).",
+        examples=[{"priority": 0, "standard": 3, "elastic": 0}],
+    )
+    backlog: int = Field(description="Total messages waiting across all queues.", examples=[3])
+    pressure: int = Field(
+        description="Global pressure level 0-3 (folds load, latency, and the health circuit).",
+        examples=[1],
+    )
+    circuit_open: bool = Field(
+        description="True when the error-rate circuit breaker has tripped.", examples=[False]
+    )
+    pool_target: dict[str, int] = Field(
+        description="Autoscaler's current target worker count per pool.",
+        examples=[{"priority": 4, "standard": 8, "elastic": 0}],
+    )
+
+    model_config = {"extra": "allow"}
 
 
 def _client_ip(websocket: WebSocket) -> str:
@@ -61,12 +139,27 @@ def _client_ip(websocket: WebSocket) -> str:
     return websocket.client.host if websocket.client else "unknown"
 
 
-@app.get("/healthz")
+@app.get(
+    "/healthz",
+    tags=["ops"],
+    summary="Liveness probe",
+    description="Returns `{\"status\": \"ok\"}` if the API process is up. Used by the "
+    "load balancer / orchestrator health checks; does not touch Redis or Postgres.",
+    response_model=HealthResponse,
+)
 async def healthz() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/metrics")
+@app.get(
+    "/metrics",
+    tags=["ops"],
+    summary="Live pipeline metrics",
+    description="A point-in-time snapshot of the pipeline: queue depth and backlog, the "
+    "global pressure level, the error-circuit state, per-pool worker targets, worker "
+    "health, and analytics counters. Cheap to call (one LB snapshot + a small Redis pipeline).",
+    response_model=MetricsResponse,
+)
 async def metrics() -> dict:
     lb: LoadBalancer = app.state.lb
     health: HealthRegistry = app.state.health
@@ -86,9 +179,14 @@ async def metrics() -> dict:
     }
 
 
-@app.websocket("/ws/chat")
+@app.websocket("/ws/chat", name="chat")
 async def ws_chat(websocket: WebSocket) -> None:
-    """`?user_id=<uuid>`. Send `{"message": "..."}`; receive token/done/notice frames."""
+    """Chat stream — `?user_id=<uuid>`.
+
+    Send `{"message": "..."}` frames; receive `token` / `done` / `notice` frames.
+    See the WebSocket contract in the app description for the full frame schema.
+    (WebSocket routes are not rendered in `/docs`.)
+    """
     await websocket.accept()
 
     # Coarse per-IP guard before any DB work — flood / fake-user_id defense.
